@@ -1,0 +1,159 @@
+modified for multiple screen
+import cv2
+import numpy as np
+import time
+import smbus2
+import RPi.GPIO as GPIO
+from math import atan2, pi, tan, degrees
+import board
+import busio
+from adafruit_ssd1306 import SSD1306_I2C
+from PIL import Image, ImageDraw, ImageFont
+
+# --- I2C MPU6050 Setup ---
+bus = smbus2.SMBus(1)
+MPU_ADDR = 0x68
+bus.write_byte_data(MPU_ADDR, 0x6B, 0)  # Wake MPU6050
+
+# --- Servo & Ultrasonic Setup ---
+GPIO.setmode(GPIO.BCM)
+SERVO_X_PIN = 17
+SERVO_Y_PIN = 27
+TRIG_PIN = 23
+ECHO_PIN = 24
+GPIO.setup([TRIG_PIN], GPIO.OUT)
+GPIO.setup([ECHO_PIN], GPIO.IN)
+GPIO.setup(SERVO_X_PIN, GPIO.OUT)
+GPIO.setup(SERVO_Y_PIN, GPIO.OUT)
+servo_x = GPIO.PWM(SERVO_X_PIN, 50)
+servo_y = GPIO.PWM(SERVO_Y_PIN, 50)
+servo_x.start(7.5)  # 90 deg
+servo_y.start(7.5)
+servo_angle_x = 90
+servo_angle_y = 90
+
+# --- I2C OLED Setup ---
+i2c = busio.I2C(board.SCL, board.SDA)
+oled1 = SSD1306_I2C(128, 64, i2c, addr=0x3C)  # Angle
+oled2 = SSD1306_I2C(128, 64, i2c, addr=0x3D)  # Distance
+oled3 = SSD1306_I2C(128, 64, i2c, addr=0x3E)  # Height
+oled4 = SSD1306_I2C(128, 64, i2c, addr=0x3F)  # Coordinates
+
+font = ImageFont.load_default()
+
+def show_on_oled(oled, text):
+    image = Image.new("1", (128, 64))
+    draw = ImageDraw.Draw(image)
+    draw.text((0, 0), text, font=font, fill=255)
+    oled.image(image)
+    oled.show()
+
+def angle_to_duty(angle):
+    return 2.5 + (angle / 18)
+
+def adjust_servo(pin_pwm, angle):
+    pin_pwm.ChangeDutyCycle(angle_to_duty(angle))
+    time.sleep(0.1)
+
+def read_distance_cm():
+    GPIO.output(TRIG_PIN, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG_PIN, False)
+    while GPIO.input(ECHO_PIN) == 0:
+        pulse_start = time.time()
+    while GPIO.input(ECHO_PIN) == 1:
+        pulse_end = time.time()
+    duration = pulse_end - pulse_start
+    return (duration * 34300) / 2  # in cm
+
+def read_word_2c(addr):
+    high = bus.read_byte_data(MPU_ADDR, addr)
+    low = bus.read_byte_data(MPU_ADDR, addr + 1)
+    val = (high << 8) + low
+    return val - 65536 if val >= 0x8000 else val
+
+def read_mpu_angle_y():
+    accel_x = read_word_2c(0x3B)
+    accel_z = read_word_2c(0x3F)
+    return degrees(atan2(-accel_x, -accel_z))
+
+def pixel_to_angle(pix_err, pixels_per_deg=10):
+    return pix_err / pixels_per_deg
+
+class PID:
+    def _init_(self, kp, ki, kd):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.integral_x = self.integral_y = 0
+        self.prev_x = self.prev_y = 0
+
+    def compute(self, error_x, error_y, dt):
+        self.integral_x += error_x * dt
+        self.integral_y += error_y * dt
+        dx = (error_x - self.prev_x) / dt
+        dy = (error_y - self.prev_y) / dt
+        out_x = self.kp * error_x + self.ki * self.integral_x + self.kd * dx
+        out_y = self.kp * error_y + self.ki * self.integral_y + self.kd * dy
+        self.prev_x, self.prev_y = error_x, error_y
+        return out_x, out_y
+
+cap = cv2.VideoCapture(0)
+pid = PID(0.3, 0.01, 0.1)
+dt = 0.1
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        object_tip = None
+        if contours:
+            top = tuple(max(contours, key=cv2.contourArea)[..., 1].argmin())
+            object_tip = tuple(contours[0][top][0])
+            cv2.circle(frame, object_tip, 5, (0, 255, 0), -1)
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0,100,100), (10,255,255)) | cv2.inRange(hsv, (160,100,100), (180,255,255))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        laser_dot = None
+        if contours:
+            M = cv2.moments(max(contours, key=cv2.contourArea))
+            if M["m00"]:
+                cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                laser_dot = (cx, cy)
+                cv2.circle(frame, laser_dot, 5, (0,0,255), -1)
+
+        if laser_dot and object_tip:
+            err_x = laser_dot[0] - object_tip[0]
+            err_y = laser_dot[1] - object_tip[1]
+            adj_x, adj_y = pid.compute(err_x, err_y, dt)
+            servo_angle_x = np.clip(servo_angle_x - pixel_to_angle(adj_x), 0, 180)
+            servo_angle_y = np.clip(servo_angle_y - pixel_to_angle(adj_y), 0, 180)
+            adjust_servo(servo_x, servo_angle_x)
+            adjust_servo(servo_y, servo_angle_y)
+
+            if abs(err_x) < 5 and abs(err_y) < 5:
+                distance = read_distance_cm()
+                angle = read_mpu_angle_y()
+                height = distance * tan(angle * (pi / 180.0))
+                show_on_oled(oled1, f"Angle: {angle:.2f} deg")
+                show_on_oled(oled2, f"Distance: {distance:.2f} cm")
+                show_on_oled(oled3, f"Height: {height:.2f} cm")
+                show_on_oled(oled4, f"Tip: {object_tip}")
+
+        cv2.imshow("Laser Tracker", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+        time.sleep(dt)
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    servo_x.stop()
+    servo_y.stop()
+    GPIO.cleanup()
